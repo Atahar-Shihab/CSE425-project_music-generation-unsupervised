@@ -1,0 +1,14 @@
+# Ignore Virtual Environment
+venv/
+
+# Ignore Python Cache
+__pycache__/
+*.pyc
+
+# Ignore massive datasets and model weights (GitHub has a 100MB file limit)
+data/raw_midi/
+data/processed/
+*.pt
+
+# Ignore OS files
+.DS_Store
