@@ -1,73 +1,49 @@
 import torch
 import torch.nn as nn
-import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
-import os
 
-# ==========================================
-# 1. MODEL ARCHITECTURE: Variational Autoencoder
-# ==========================================
 class MusicVAE(nn.Module):
-    def __init__(self, sequence_length=128, feature_dim=88, hidden_dim=512, latent_dim=128):
+    def __init__(self, feature_dim=88, hidden_dim=256, latent_dim=128):
         super(MusicVAE, self).__init__()
         
-        self.sequence_length = sequence_length
-        self.feature_dim = feature_dim
-        self.input_dim = sequence_length * feature_dim
+        # Encoder
+        self.encoder_lstm = nn.LSTM(feature_dim, hidden_dim, batch_first=True)
+        self.fc_mu = nn.Linear(hidden_dim, latent_dim)
+        self.fc_logvar = nn.Linear(hidden_dim, latent_dim)
         
-        # Encoder: Maps X to latent distribution parameters (mu, sigma)
-        self.fc1 = nn.Linear(self.input_dim, hidden_dim)
-        self.fc2_mu = nn.Linear(hidden_dim, latent_dim)      
-        self.fc2_logvar = nn.Linear(hidden_dim, latent_dim)  
-        
-        # Decoder: Maps latent vector z back to reconstructed X
-        self.fc3 = nn.Linear(latent_dim, hidden_dim)
-        self.fc4 = nn.Linear(hidden_dim, self.input_dim)
+        # Decoder
+        self.decoder_fc = nn.Linear(latent_dim, hidden_dim)
+        self.decoder_lstm = nn.LSTM(hidden_dim, feature_dim, batch_first=True)
         
     def encode(self, x):
-        h1 = F.relu(self.fc1(x))
-        return self.fc2_mu(h1), self.fc2_logvar(h1)
-    
+        _, (hidden, _) = self.encoder_lstm(x)
+        hidden = hidden.squeeze(0)
+        mu = self.fc_mu(hidden)
+        logvar = self.fc_logvar(hidden)
+        return mu, logvar
+        
     def reparameterize(self, mu, logvar):
-        """ 
-        The Reparameterization Trick: z = mu + sigma * epsilon 
-        Allows backpropagation through the random sampling process.
-        """
         std = torch.exp(0.5 * logvar)
         eps = torch.randn_like(std)
         return mu + eps * std
         
-    def decode(self, z):
-        h3 = F.relu(self.fc3(z))
-        # Sigmoid bounds the output between 0 and 1 (note off / note on)
-        return torch.sigmoid(self.fc4(h3))
-    
+    def decode(self, z, seq_len=128):
+        z_expanded = self.decoder_fc(z).unsqueeze(1).repeat(1, seq_len, 1)
+        out, _ = self.decoder_lstm(z_expanded)
+        return torch.sigmoid(out)
+        
     def forward(self, x):
-        x_flat = x.view(-1, self.input_dim)
-        mu, logvar = self.encode(x_flat)
+        seq_len = x.shape[1]
+        mu, logvar = self.encode(x)
         z = self.reparameterize(mu, logvar)
-        reconstructed_flat = self.decode(z)
-        return reconstructed_flat.view(-1, self.sequence_length, self.feature_dim), mu, logvar
+        reconstructed = self.decode(z, seq_len)
+        return reconstructed, mu, logvar
 
-# ==========================================
-# 2. LOSS FUNCTION
-# ==========================================
-def vae_loss_function(reconstructed_x, x, mu, logvar, beta=0.1):
-    """
-    Computes L_VAE = L_recon + beta * D_KL
-    """
-    # Reconstruction Loss (Binary Cross Entropy)
-    BCE = F.binary_cross_entropy(reconstructed_x, x, reduction='sum')
+def vae_loss(reconstructed, target, mu, logvar):
+    # Reconstruction Loss
+    BCE = F.binary_cross_entropy(reconstructed, target, reduction='sum')
     
     # KL Divergence
     KLD = -0.5 * torch.sum(1 + logvar - mu.pow(2) - logvar.exp())
     
-    return BCE + beta * KLD, BCE, KLD
-
-# ==========================================
-# 3. TRAINING LOOP
-# ==========================================
-
-if __name__ == "__main__":
-    train_model()
+    return BCE + KLD

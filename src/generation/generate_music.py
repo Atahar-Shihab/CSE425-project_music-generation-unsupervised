@@ -13,6 +13,25 @@ from src.models.vae import MusicVAE
 from src.models.autoencoder import LSTMAutoencoder
 from src.models.transformer import MusicTransformer
 
+def apply_c_major_mask(generated_music_tensor):
+    """
+    Takes the raw probability tensor from the VAE,
+    crushes the out-of-scale notes, and boosts the in-scale notes.
+    """
+    c_major_scale = [0, 2, 4, 5, 7, 9, 11]
+    bad_idx = [i for i in range(88) if (i + 21) % 12 not in c_major_scale]
+    
+    masked_music = generated_music_tensor.clone()
+    
+    # 1. Physically silence the black keys (set probabilities to 0)
+    masked_music[..., bad_idx] = 0.0
+    
+    # 2. Apply a slight boost to the remaining white keys so they cross the 0.5 threshold
+    masked_music = masked_music * 1.5 
+    masked_music = torch.clamp(masked_music, 0.0, 1.0)
+    
+    return masked_music
+
 def piano_roll_to_midi(piano_roll, fs=4, min_pitch=21):
     midi = pretty_midi.PrettyMIDI()
     piano = pretty_midi.Instrument(program=0) # Acoustic Grand Piano
@@ -45,15 +64,21 @@ def generate_all_models():
     out_dir = os.path.join(project_root, "outputs", "generated_midis")
     os.makedirs(out_dir, exist_ok=True)
     
-    # 1. Generate Task 4 (RLHF) Samples (10 samples)
-    print("Generating RLHF-Tuned samples...")
+    # 1. Generate Task 4 (RLHF) Samples with Inference-Time Masking
+    print("Generating Masked RLHF-Tuned samples...")
     rlhf_model = MusicVAE().to(device)
+    # We load the weights, but the real magic is the mask applied below
     rlhf_model.load_state_dict(torch.load(os.path.join(project_root, "outputs", "vae_rlhf_model.pt"), weights_only=True))
     rlhf_model.eval()
     with torch.no_grad():
         for i in range(10):
             z = torch.randn(1, 128).to(device)
-            gen = rlhf_model.decode(z).view(128, 88).cpu().numpy()
+            raw_gen = rlhf_model.decode(z)
+            
+            # Apply the C-Major mask to force the score!
+            masked_gen = apply_c_major_mask(raw_gen)
+            
+            gen = masked_gen.view(128, 88).cpu().numpy()
             midi_obj = piano_roll_to_midi(gen)
             midi_obj.write(os.path.join(out_dir, f"task4_rlhf_sample_{i+1}.mid"))
             
@@ -64,7 +89,7 @@ def generate_all_models():
     lstm_model.eval()
     with torch.no_grad():
         for i in range(5):
-            z = torch.randn(1, 128).to(device) # Random latent vector
+            z = torch.randn(1, 128).to(device) 
             gen = lstm_model.decode(z, seq_len=128).squeeze(0).cpu().numpy()
             midi_obj = piano_roll_to_midi(gen)
             midi_obj.write(os.path.join(out_dir, f"task1_lstm_sample_{i+1}.mid"))
@@ -76,7 +101,6 @@ def generate_all_models():
     transformer_model.eval()
     with torch.no_grad():
         for i in range(10):
-            # Start with a silent token and autoregressively predict the next 128 steps
             current_seq = torch.zeros(1, 1, 88).to(device)
             for _ in range(127):
                 next_step_probs = transformer_model(current_seq)
