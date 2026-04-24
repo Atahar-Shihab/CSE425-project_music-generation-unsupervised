@@ -83,7 +83,7 @@ if __name__ == "__main__":
     DATA_DIR = "data/raw_midi/lmd_full" 
     
     # Start small! Process just 100 files to test it out quickly.
-    dataset_array = create_dataset(DATA_DIR, max_files=5000)
+    dataset_array = create_dataset(DATA_DIR, max_files=15000)
     
     if dataset_array.size > 0:
         # Convert the NumPy array to a PyTorch tensor

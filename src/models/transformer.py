@@ -5,6 +5,8 @@ from torch.utils.data import DataLoader, TensorDataset
 import os
 import math
 
+from training.train_transformer import train_transformer
+
 # ==========================================
 # 1. TASK 3: TRANSFORMER ARCHITECTURE
 # ==========================================
@@ -49,7 +51,6 @@ class MusicTransformer(nn.Module):
 # ==========================================
 # 2. TRAINING LOOP & PERPLEXITY METRIC
 # ==========================================
-def train_transformer():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Training Transformer on device: {device}")
 
@@ -91,6 +92,6 @@ def train_transformer():
     save_dir = os.path.join(project_root, "outputs")
     torch.save(model.state_dict(), os.path.join(save_dir, "transformer_model.pt"))
     print("\nTask 3 Complete! Transformer weights saved.")
-
+    
 if __name__ == "__main__":
     train_transformer()
