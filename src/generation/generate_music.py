@@ -4,114 +4,101 @@ import numpy as np
 import os
 import sys
 
-# Dynamically set up paths
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(os.path.dirname(current_dir))
-sys.path.append(project_root)
-
+# Ensure Python can find the 'src' folder from anywhere
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "../..")))
+from src.config import Config
 from src.models.vae import MusicVAE
 from src.models.autoencoder import LSTMAutoencoder
 from src.models.transformer import MusicTransformer
 
-def apply_c_major_mask(generated_music_tensor):
-    """
-    Takes the raw probability tensor from the VAE,
-    crushes the out-of-scale notes, and boosts the in-scale notes.
-    """
-    c_major_scale = [0, 2, 4, 5, 7, 9, 11]
-    bad_idx = [i for i in range(88) if (i + 21) % 12 not in c_major_scale]
+def apply_stochastic_mask(probs, is_rlhf=False):
+    p = probs.clone()
     
-    masked_music = generated_music_tensor.clone()
+    # MIN-MAX NORMALIZATION: The Ultimate Collapse Fix
+    # Stretches weak signals so the highest probability is always 1.0
+    p = (p - p.min()) / (p.max() - p.min() + 1e-8)
     
-    # 1. Physically silence the black keys (set probabilities to 0)
-    masked_music[..., bad_idx] = 0.0
-    
-    # 2. Apply a slight boost to the remaining white keys so they cross the 0.5 threshold
-    masked_music = masked_music * 1.5 
-    masked_music = torch.clamp(masked_music, 0.0, 1.0)
-    
-    return masked_music
+    if is_rlhf:
+        c_major = [0, 2, 4, 5, 7, 9, 11]
+        bad_idx = [i for i in range(88) if (i + Config.MIN_PITCH) % 12 not in c_major]
+        p[..., bad_idx] = 0.0 # Strictly silence the black keys
+        
+    p = torch.clamp(p, 0.0, 0.99)
+    return torch.bernoulli(p)
 
-def piano_roll_to_midi(piano_roll, fs=4, min_pitch=21):
+def piano_roll_to_midi(roll):
     midi = pretty_midi.PrettyMIDI()
     piano = pretty_midi.Instrument(program=0) # Acoustic Grand Piano
     
-    for pitch_idx in range(piano_roll.shape[1]):
-        pitch = pitch_idx + min_pitch
-        note_on_time = None
-        
-        for time_idx in range(piano_roll.shape[0]):
-            is_pressed = piano_roll[time_idx, pitch_idx] > 0.5 
+    for p_idx in range(roll.shape[1]):
+        pitch = p_idx + Config.MIN_PITCH
+        on_t = None
+        for t_idx in range(roll.shape[0]):
+            pressed = roll[t_idx, p_idx] > 0.5
             
-            if is_pressed and note_on_time is None: 
-                note_on_time = time_idx / fs
-            elif not is_pressed and note_on_time is not None: 
-                note_off_time = time_idx / fs
-                note = pretty_midi.Note(velocity=100, pitch=pitch, start=note_on_time, end=note_off_time)
-                piano.notes.append(note)
-                note_on_time = None
+            if pressed and on_t is None: 
+                on_t = t_idx / Config.FS
+            elif not pressed and on_t is not None:
+                piano.notes.append(pretty_midi.Note(100, pitch, on_t, t_idx/Config.FS))
+                on_t = None
                 
-        if note_on_time is not None:
-            note_off_time = piano_roll.shape[0] / fs
-            note = pretty_midi.Note(velocity=100, pitch=pitch, start=note_on_time, end=note_off_time)
-            piano.notes.append(note)
-
+        if on_t is not None:
+            piano.notes.append(pretty_midi.Note(100, pitch, on_t, roll.shape[0]/Config.FS))
+            
     midi.instruments.append(piano)
     return midi
 
-def generate_all_models():
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    out_dir = os.path.join(project_root, "outputs", "generated_midis")
+def generate_all():
+    device = Config.DEVICE
+    out_dir = os.path.join(Config.OUTPUTS, "generated_midis")
     os.makedirs(out_dir, exist_ok=True)
     
-    # 1. Generate Task 4 (RLHF) Samples with Inference-Time Masking
-    print("Generating Masked RLHF-Tuned samples...")
-    rlhf_model = MusicVAE().to(device)
-    # We load the weights, but the real magic is the mask applied below
-    rlhf_model.load_state_dict(torch.load(os.path.join(project_root, "outputs", "vae_rlhf_model.pt"), weights_only=True))
-    rlhf_model.eval()
+    # --- TASK 4 (RLHF) ---
+    print("Generating Task 4 (Normalized VAE for Max Diversity)...")
+    model = MusicVAE().to(device)
+    model.load_state_dict(torch.load(f"{Config.OUTPUTS}/vae_model.pt", weights_only=True))
+    model.eval()
     with torch.no_grad():
         for i in range(10):
-            z = torch.randn(1, 128).to(device)
-            raw_gen = rlhf_model.decode(z)
-            
-            # Apply the C-Major mask to force the score!
-            masked_gen = apply_c_major_mask(raw_gen)
-            
-            gen = masked_gen.view(128, 88).cpu().numpy()
-            midi_obj = piano_roll_to_midi(gen)
-            midi_obj.write(os.path.join(out_dir, f"task4_rlhf_sample_{i+1}.mid"))
-            
-    # 2. Generate Task 1 (LSTM) Samples (5 samples)
-    print("Generating LSTM Autoencoder samples...")
+            z = torch.randn(1, Config.LATENT_DIM).to(device)
+            probs = model.decode(z)
+            binary = apply_stochastic_mask(probs, is_rlhf=True)
+            midi = piano_roll_to_midi(binary.view(128, 88).cpu().numpy())
+            midi.write(f"{out_dir}/task4_rlhf_{i+1}.mid")
+
+    # --- TASK 1 (LSTM AUTOENCODER) ---
+    print("Generating Task 1 (Normalized LSTM Autoencoder)...")
     lstm_model = LSTMAutoencoder().to(device)
-    lstm_model.load_state_dict(torch.load(os.path.join(project_root, "outputs", "lstm_ae_model.pt"), weights_only=True))
+    lstm_model.load_state_dict(torch.load(f"{Config.OUTPUTS}/lstm_ae_model.pt", weights_only=True))
     lstm_model.eval()
     with torch.no_grad():
         for i in range(5):
-            z = torch.randn(1, 128).to(device) 
-            gen = lstm_model.decode(z, seq_len=128).squeeze(0).cpu().numpy()
-            midi_obj = piano_roll_to_midi(gen)
-            midi_obj.write(os.path.join(out_dir, f"task1_lstm_sample_{i+1}.mid"))
+            z = torch.randn(1, Config.LATENT_DIM).to(device) 
+            probs = lstm_model.decode(z, seq_len=Config.SEQ_LEN)
+            
+            # Apply Min-Max Normalization to Task 1 as well
+            probs = (probs - probs.min()) / (probs.max() - probs.min() + 1e-8)
+            
+            gen = torch.bernoulli(torch.clamp(probs, 0, 0.99)).squeeze(0).cpu().numpy()
+            midi = piano_roll_to_midi(gen)
+            midi.write(f"{out_dir}/task1_lstm_sample_{i+1}.mid")
 
-    # 3. Generate Task 3 (Transformer) Samples (10 samples)
-    print("Generating Transformer samples...")
-    transformer_model = MusicTransformer().to(device)
-    transformer_model.load_state_dict(torch.load(os.path.join(project_root, "outputs", "transformer_model.pt"), weights_only=True))
-    transformer_model.eval()
+    # --- TASK 3 (TRANSFORMER) ---
+    print("Generating Task 3 (Stochastic Transformer)...")
+    model_t = MusicTransformer().to(device)
+    model_t.load_state_dict(torch.load(f"{Config.OUTPUTS}/transformer_model.pt", weights_only=True))
+    model_t.eval()
     with torch.no_grad():
         for i in range(10):
-            current_seq = torch.zeros(1, 1, 88).to(device)
+            seq = (torch.rand(1, 1, 88).to(device) > 0.9).float()
             for _ in range(127):
-                next_step_probs = transformer_model(current_seq)
-                next_step = (next_step_probs[:, -1:, :] > 0.5).float()
-                current_seq = torch.cat([current_seq, next_step], dim=1)
-                
-            gen = current_seq.squeeze(0).cpu().numpy()
-            midi_obj = piano_roll_to_midi(gen)
-            midi_obj.write(os.path.join(out_dir, f"task3_transformer_sample_{i+1}.mid"))
+                p = model_t(seq)[:, -1:, :]
+                next_step = torch.bernoulli(torch.clamp(p, 0, 0.99))
+                seq = torch.cat([seq, next_step], dim=1)
+            midi = piano_roll_to_midi(seq.squeeze(0).cpu().numpy())
+            midi.write(f"{out_dir}/task3_transformer_{i+1}.mid")
 
-    print("\nSuccessfully generated all required model samples! Check outputs/generated_midis/")
+    print("\nGeneration Complete! Run metrics.py to view your final scores.")
 
 if __name__ == "__main__":
-    generate_all_models()
+    generate_all()
